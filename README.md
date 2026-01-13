@@ -1,13 +1,14 @@
 # 📈 A股智能分析系统
 
 [![GitHub stars](https://img.shields.io/github/stars/ZhuLinsen/daily_stock_analysis?style=social)](https://github.com/ZhuLinsen/daily_stock_analysis/stargazers)
+[![CI](https://github.com/ZhuLinsen/daily_stock_analysis/actions/workflows/ci.yml/badge.svg)](https://github.com/ZhuLinsen/daily_stock_analysis/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-Ready-2088FF?logo=github-actions&logoColor=white)](https://github.com/features/actions)
 
 > 🤖 基于 AI 大模型的 A 股自选股智能分析系统，每日自动分析并推送「决策仪表盘」到企业微信/飞书/Telegram/邮箱
 
-![运行效果演示](./sources/2026-01-10_155341_daily_analysis.gif)
+![运行效果演示](./sources/all_2026-01-13_221547.gif)
 
 ## ✨ 功能特性
 
@@ -68,9 +69,12 @@
 | `TELEGRAM_CHAT_ID` | Telegram Chat ID | 可选 |
 | `EMAIL_SENDER` | 发件人邮箱（如 `xxx@qq.com`） | 可选 |
 | `EMAIL_PASSWORD` | 邮箱授权码（非登录密码） | 可选 |
-| `EMAIL_RECEIVERS` | 收件人邮箱（留空则发给自己） | 可选 |
+| `EMAIL_RECEIVERS` | 收件人邮箱（多个用逗号分隔，留空则发给自己） | 可选 |
+| `CUSTOM_WEBHOOK_URLS` | 自定义 Webhook（多个用逗号分隔） | 可选 |
 
 > *注：至少配置一个渠道，配置多个则同时推送到所有渠道
+> 
+> 自定义 Webhook 支持：钉钉、Discord、Slack、Bark、自建服务等任意支持 POST JSON 的 Webhook
 
 **其他配置**
 
@@ -148,6 +152,9 @@ docker-compose logs -f
 ```
 
 ### 大盘复盘
+
+![大盘复盘推送效果](./sources/dapan_2026-01-13_22-14-52.png)
+
 ```
 🎯 2026-01-10 大盘复盘
 
@@ -231,10 +238,8 @@ daily_stock_analysis/
 - [x] 飞书机器人
 - [x] Telegram Bot
 - [x] 邮件通知（SMTP）
-- [ ] 钉钉机器人
-- [ ] Discord Webhook
-- [ ] Slack Webhook
-- [ ] iOS/Android 推送（Bark/Pushover）
+- [x] 自定义 Webhook（支持钉钉、Discord、Slack、Bark 等）
+- [ ] iOS/Android 推送（Pushover）
 
 ### 🤖 AI 模型支持
 - [x] Google Gemini（主力，免费额度）

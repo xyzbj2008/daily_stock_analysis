@@ -38,6 +38,7 @@ class NotificationChannel(Enum):
     FEISHU = "feishu"      # 飞书
     TELEGRAM = "telegram"  # Telegram
     EMAIL = "email"        # 邮件
+    CUSTOM = "custom"      # 自定义 Webhook
     UNKNOWN = "unknown"    # 未知
 
 
@@ -80,6 +81,7 @@ class ChannelDetector:
             NotificationChannel.FEISHU: "飞书",
             NotificationChannel.TELEGRAM: "Telegram",
             NotificationChannel.EMAIL: "邮件",
+            NotificationChannel.CUSTOM: "自定义Webhook",
             NotificationChannel.UNKNOWN: "未知渠道",
         }
         return names.get(channel, "未知渠道")
@@ -128,6 +130,13 @@ class NotificationService:
             'receivers': config.email_receivers or ([config.email_sender] if config.email_sender else []),
         }
         
+        # 自定义 Webhook 配置
+        self._custom_webhook_urls = getattr(config, 'custom_webhook_urls', []) or []
+        
+        # 消息长度限制（字节）
+        self._feishu_max_bytes = getattr(config, 'feishu_max_bytes', 20000)
+        self._wechat_max_bytes = getattr(config, 'wechat_max_bytes', 4000)
+        
         # 检测所有已配置的渠道
         self._available_channels = self._detect_all_channels()
         
@@ -161,6 +170,10 @@ class NotificationService:
         # 邮件
         if self._is_email_configured():
             channels.append(NotificationChannel.EMAIL)
+        
+        # 自定义 Webhook
+        if self._custom_webhook_urls:
+            channels.append(NotificationChannel.CUSTOM)
         
         return channels
     
@@ -889,7 +902,8 @@ class NotificationService:
             }
         }
         
-        注意：企业微信 Markdown 限制 4096 字符
+        注意：企业微信 Markdown 限制 4096 字节（非字符），超长内容会自动分批发送
+        可通过环境变量 WECHAT_MAX_BYTES 调整限制值
         
         Args:
             content: Markdown 格式的消息内容
@@ -901,16 +915,190 @@ class NotificationService:
             logger.warning("企业微信 Webhook 未配置，跳过推送")
             return False
         
-        # 检查长度
-        if len(content) > 4000:
-            logger.warning(f"消息内容超长({len(content)}字符)，将截断至4000字符")
-            content = content[:3950] + "\n\n...(内容过长已截断，详见完整报告)"
+        max_bytes = self._wechat_max_bytes  # 从配置读取，默认 4000 字节
+        
+        # 检查字节长度，超长则分批发送
+        content_bytes = len(content.encode('utf-8'))
+        if content_bytes > max_bytes:
+            logger.info(f"消息内容超长({content_bytes}字节/{len(content)}字符)，将分批发送")
+            return self._send_wechat_chunked(content, max_bytes)
         
         try:
             return self._send_wechat_message(content)
         except Exception as e:
             logger.error(f"发送企业微信消息失败: {e}")
             return False
+    
+    def _send_wechat_chunked(self, content: str, max_bytes: int) -> bool:
+        """
+        分批发送长消息到企业微信
+        
+        按股票分析块（以 --- 或 ### 分隔）智能分割，确保每批不超过限制
+        
+        Args:
+            content: 完整消息内容
+            max_bytes: 单条消息最大字节数
+            
+        Returns:
+            是否全部发送成功
+        """
+        import time
+        
+        def get_bytes(s: str) -> int:
+            """获取字符串的 UTF-8 字节数"""
+            return len(s.encode('utf-8'))
+        
+        # 智能分割：优先按 "---" 分隔（股票之间的分隔线）
+        # 如果没有分隔线，按 "### " 标题分割（每只股票的标题）
+        if "\n---\n" in content:
+            sections = content.split("\n---\n")
+            separator = "\n---\n"
+        elif "\n### " in content:
+            # 按 ### 分割，但保留 ### 前缀
+            parts = content.split("\n### ")
+            sections = [parts[0]] + [f"### {p}" for p in parts[1:]]
+            separator = "\n"
+        else:
+            # 无法智能分割，按字符强制分割
+            return self._send_wechat_force_chunked(content, max_bytes)
+        
+        chunks = []
+        current_chunk = []
+        current_bytes = 0
+        separator_bytes = get_bytes(separator)
+        
+        for section in sections:
+            section_bytes = get_bytes(section) + separator_bytes
+            
+            # 如果单个 section 就超长，需要强制截断
+            if section_bytes > max_bytes:
+                # 先发送当前积累的内容
+                if current_chunk:
+                    chunks.append(separator.join(current_chunk))
+                    current_chunk = []
+                    current_bytes = 0
+                
+                # 强制截断这个超长 section（按字节截断）
+                truncated = self._truncate_to_bytes(section, max_bytes - 200)
+                truncated += "\n\n...(本段内容过长已截断)"
+                chunks.append(truncated)
+                continue
+            
+            # 检查加入后是否超长
+            if current_bytes + section_bytes > max_bytes:
+                # 保存当前块，开始新块
+                if current_chunk:
+                    chunks.append(separator.join(current_chunk))
+                current_chunk = [section]
+                current_bytes = section_bytes
+            else:
+                current_chunk.append(section)
+                current_bytes += section_bytes
+        
+        # 添加最后一块
+        if current_chunk:
+            chunks.append(separator.join(current_chunk))
+        
+        # 分批发送
+        total_chunks = len(chunks)
+        success_count = 0
+        
+        logger.info(f"企业微信分批发送：共 {total_chunks} 批")
+        
+        for i, chunk in enumerate(chunks):
+            # 添加分页标记
+            if total_chunks > 1:
+                page_marker = f"\n\n📄 *({i+1}/{total_chunks})*"
+                chunk_with_marker = chunk + page_marker
+            else:
+                chunk_with_marker = chunk
+            
+            try:
+                if self._send_wechat_message(chunk_with_marker):
+                    success_count += 1
+                    logger.info(f"企业微信第 {i+1}/{total_chunks} 批发送成功")
+                else:
+                    logger.error(f"企业微信第 {i+1}/{total_chunks} 批发送失败")
+            except Exception as e:
+                logger.error(f"企业微信第 {i+1}/{total_chunks} 批发送异常: {e}")
+            
+            # 批次间隔，避免触发频率限制
+            if i < total_chunks - 1:
+                time.sleep(1)
+        
+        return success_count == total_chunks
+    
+    def _send_wechat_force_chunked(self, content: str, max_bytes: int) -> bool:
+        """
+        强制按字节分割发送（无法智能分割时的 fallback）
+        
+        Args:
+            content: 完整消息内容
+            max_bytes: 单条消息最大字节数
+        """
+        import time
+        
+        chunks = []
+        current_chunk = ""
+        
+        # 按行分割，确保不会在多字节字符中间截断
+        lines = content.split('\n')
+        
+        for line in lines:
+            test_chunk = current_chunk + ('\n' if current_chunk else '') + line
+            if len(test_chunk.encode('utf-8')) > max_bytes - 100:  # 预留空间给分页标记
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = line
+            else:
+                current_chunk = test_chunk
+        
+        if current_chunk:
+            chunks.append(current_chunk)
+        
+        total_chunks = len(chunks)
+        success_count = 0
+        
+        logger.info(f"企业微信强制分批发送：共 {total_chunks} 批")
+        
+        for i, chunk in enumerate(chunks):
+            page_marker = f"\n\n📄 *({i+1}/{total_chunks})*" if total_chunks > 1 else ""
+            
+            try:
+                if self._send_wechat_message(chunk + page_marker):
+                    success_count += 1
+            except Exception as e:
+                logger.error(f"企业微信第 {i+1}/{total_chunks} 批发送异常: {e}")
+            
+            if i < total_chunks - 1:
+                time.sleep(1)
+        
+        return success_count == total_chunks
+    
+    def _truncate_to_bytes(self, text: str, max_bytes: int) -> str:
+        """
+        按字节数截断字符串，确保不会在多字节字符中间截断
+        
+        Args:
+            text: 要截断的字符串
+            max_bytes: 最大字节数
+            
+        Returns:
+            截断后的字符串
+        """
+        encoded = text.encode('utf-8')
+        if len(encoded) <= max_bytes:
+            return text
+        
+        # 从 max_bytes 位置往前找，确保不截断多字节字符
+        truncated = encoded[:max_bytes]
+        # 尝试解码，如果失败则继续往前
+        while truncated:
+            try:
+                return truncated.decode('utf-8')
+            except UnicodeDecodeError:
+                truncated = truncated[:-1]
+        return ""
     
     def _send_wechat_message(self, content: str) -> bool:
         """发送企业微信消息"""
@@ -951,7 +1139,8 @@ class NotificationService:
             }
         }
         
-        注意：飞书文本消息无严格长度限制，但建议控制在合理范围
+        注意：飞书文本消息限制约 20KB，超长内容会自动分批发送
+        可通过环境变量 FEISHU_MAX_BYTES 调整限制值
         
         Args:
             content: 消息内容（Markdown 会转为纯文本）
@@ -963,56 +1152,202 @@ class NotificationService:
             logger.warning("飞书 Webhook 未配置，跳过推送")
             return False
         
+        max_bytes = self._feishu_max_bytes  # 从配置读取，默认 20000 字节
+        
+        # 检查字节长度，超长则分批发送
+        content_bytes = len(content.encode('utf-8'))
+        if content_bytes > max_bytes:
+            logger.info(f"飞书消息内容超长({content_bytes}字节/{len(content)}字符)，将分批发送")
+            return self._send_feishu_chunked(content, max_bytes)
+        
         try:
-            # 飞书自定义机器人的消息格式
-            # 支持 text 和 post（富文本）两种类型
-            # 使用 post 富文本可以支持更好的格式显示
-            
-            # 将 Markdown 转换为飞书 post 格式
-            # 简化处理：使用 text 类型，保持原有格式
-            payload = {
-                "msg_type": "text",
-                "content": {
-                    "text": content
-                }
-            }
-            
-            logger.debug(f"飞书请求 URL: {self._feishu_url}")
-            logger.debug(f"飞书请求 payload: {payload}")
-            
-            response = requests.post(
-                self._feishu_url,
-                json=payload,
-                timeout=10
-            )
-            
-            logger.debug(f"飞书响应状态码: {response.status_code}")
-            logger.debug(f"飞书响应内容: {response.text}")
-            
-            if response.status_code == 200:
-                result = response.json()
-                # 飞书成功响应：
-                # - 新版: {"code": 0, "msg": "success"}
-                # - 旧版: {"StatusCode": 0, "StatusMessage": "success"}
-                code = result.get('code') if 'code' in result else result.get('StatusCode')
-                if code == 0:
-                    logger.info("飞书消息发送成功")
-                    return True
-                else:
-                    error_msg = result.get('msg') or result.get('StatusMessage', '未知错误')
-                    error_code = result.get('code') or result.get('StatusCode', 'N/A')
-                    logger.error(f"飞书返回错误 [code={error_code}]: {error_msg}")
-                    logger.error(f"完整响应: {result}")
-                    return False
-            else:
-                logger.error(f"飞书请求失败: HTTP {response.status_code}")
-                logger.error(f"响应内容: {response.text}")
-                return False
-                
+            return self._send_feishu_message(content)
         except Exception as e:
             logger.error(f"发送飞书消息失败: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
+            return False
+    
+    def _send_feishu_chunked(self, content: str, max_bytes: int) -> bool:
+        """
+        分批发送长消息到飞书
+        
+        按股票分析块（以 --- 或 ### 分隔）智能分割，确保每批不超过限制
+        
+        Args:
+            content: 完整消息内容
+            max_bytes: 单条消息最大字节数
+            
+        Returns:
+            是否全部发送成功
+        """
+        import time
+        
+        def get_bytes(s: str) -> int:
+            """获取字符串的 UTF-8 字节数"""
+            return len(s.encode('utf-8'))
+        
+        # 智能分割：优先按 "---" 分隔（股票之间的分隔线）
+        # 如果没有分隔线，按 "### " 标题分割（每只股票的标题）
+        if "\n---\n" in content:
+            sections = content.split("\n---\n")
+            separator = "\n---\n"
+        elif "\n### " in content:
+            # 按 ### 分割，但保留 ### 前缀
+            parts = content.split("\n### ")
+            sections = [parts[0]] + [f"### {p}" for p in parts[1:]]
+            separator = "\n"
+        else:
+            # 无法智能分割，按行强制分割
+            return self._send_feishu_force_chunked(content, max_bytes)
+        
+        chunks = []
+        current_chunk = []
+        current_bytes = 0
+        separator_bytes = get_bytes(separator)
+        
+        for section in sections:
+            section_bytes = get_bytes(section) + separator_bytes
+            
+            # 如果单个 section 就超长，需要强制截断
+            if section_bytes > max_bytes:
+                # 先发送当前积累的内容
+                if current_chunk:
+                    chunks.append(separator.join(current_chunk))
+                    current_chunk = []
+                    current_bytes = 0
+                
+                # 强制截断这个超长 section（按字节截断）
+                truncated = self._truncate_to_bytes(section, max_bytes - 200)
+                truncated += "\n\n...(本段内容过长已截断)"
+                chunks.append(truncated)
+                continue
+            
+            # 检查加入后是否超长
+            if current_bytes + section_bytes > max_bytes:
+                # 保存当前块，开始新块
+                if current_chunk:
+                    chunks.append(separator.join(current_chunk))
+                current_chunk = [section]
+                current_bytes = section_bytes
+            else:
+                current_chunk.append(section)
+                current_bytes += section_bytes
+        
+        # 添加最后一块
+        if current_chunk:
+            chunks.append(separator.join(current_chunk))
+        
+        # 分批发送
+        total_chunks = len(chunks)
+        success_count = 0
+        
+        logger.info(f"飞书分批发送：共 {total_chunks} 批")
+        
+        for i, chunk in enumerate(chunks):
+            # 添加分页标记
+            if total_chunks > 1:
+                page_marker = f"\n\n📄 ({i+1}/{total_chunks})"
+                chunk_with_marker = chunk + page_marker
+            else:
+                chunk_with_marker = chunk
+            
+            try:
+                if self._send_feishu_message(chunk_with_marker):
+                    success_count += 1
+                    logger.info(f"飞书第 {i+1}/{total_chunks} 批发送成功")
+                else:
+                    logger.error(f"飞书第 {i+1}/{total_chunks} 批发送失败")
+            except Exception as e:
+                logger.error(f"飞书第 {i+1}/{total_chunks} 批发送异常: {e}")
+            
+            # 批次间隔，避免触发频率限制
+            if i < total_chunks - 1:
+                time.sleep(1)
+        
+        return success_count == total_chunks
+    
+    def _send_feishu_force_chunked(self, content: str, max_bytes: int) -> bool:
+        """
+        强制按字节分割发送（无法智能分割时的 fallback）
+        
+        Args:
+            content: 完整消息内容
+            max_bytes: 单条消息最大字节数
+        """
+        import time
+        
+        chunks = []
+        current_chunk = ""
+        
+        # 按行分割，确保不会在多字节字符中间截断
+        lines = content.split('\n')
+        
+        for line in lines:
+            test_chunk = current_chunk + ('\n' if current_chunk else '') + line
+            if len(test_chunk.encode('utf-8')) > max_bytes - 100:  # 预留空间给分页标记
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = line
+            else:
+                current_chunk = test_chunk
+        
+        if current_chunk:
+            chunks.append(current_chunk)
+        
+        total_chunks = len(chunks)
+        success_count = 0
+        
+        logger.info(f"飞书强制分批发送：共 {total_chunks} 批")
+        
+        for i, chunk in enumerate(chunks):
+            page_marker = f"\n\n📄 ({i+1}/{total_chunks})" if total_chunks > 1 else ""
+            
+            try:
+                if self._send_feishu_message(chunk + page_marker):
+                    success_count += 1
+            except Exception as e:
+                logger.error(f"飞书第 {i+1}/{total_chunks} 批发送异常: {e}")
+            
+            if i < total_chunks - 1:
+                time.sleep(1)
+        
+        return success_count == total_chunks
+    
+    def _send_feishu_message(self, content: str) -> bool:
+        """发送单条飞书消息"""
+        payload = {
+            "msg_type": "text",
+            "content": {
+                "text": content
+            }
+        }
+        
+        logger.debug(f"飞书请求 URL: {self._feishu_url}")
+        logger.debug(f"飞书请求 payload 长度: {len(content)} 字符")
+        
+        response = requests.post(
+            self._feishu_url,
+            json=payload,
+            timeout=30
+        )
+        
+        logger.debug(f"飞书响应状态码: {response.status_code}")
+        logger.debug(f"飞书响应内容: {response.text}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            code = result.get('code') if 'code' in result else result.get('StatusCode')
+            if code == 0:
+                logger.info("飞书消息发送成功")
+                return True
+            else:
+                error_msg = result.get('msg') or result.get('StatusMessage', '未知错误')
+                error_code = result.get('code') or result.get('StatusCode', 'N/A')
+                logger.error(f"飞书返回错误 [code={error_code}]: {error_msg}")
+                logger.error(f"完整响应: {result}")
+                return False
+        else:
+            logger.error(f"飞书请求失败: HTTP {response.status_code}")
+            logger.error(f"响应内容: {response.text}")
             return False
     
     def send_to_email(self, content: str, subject: Optional[str] = None) -> bool:
@@ -1302,6 +1637,116 @@ class NotificationService:
         
         return result
     
+    def send_to_custom(self, content: str) -> bool:
+        """
+        推送消息到自定义 Webhook
+        
+        支持任意接受 POST JSON 的 Webhook 端点
+        默认发送格式：{"text": "消息内容", "content": "消息内容"}
+        
+        适用于：
+        - 钉钉机器人
+        - Discord Webhook
+        - Slack Incoming Webhook
+        - 自建通知服务
+        - 其他支持 POST JSON 的服务
+        
+        Args:
+            content: 消息内容（Markdown 格式）
+            
+        Returns:
+            是否至少有一个 Webhook 发送成功
+        """
+        if not self._custom_webhook_urls:
+            logger.warning("未配置自定义 Webhook，跳过推送")
+            return False
+        
+        success_count = 0
+        
+        for i, url in enumerate(self._custom_webhook_urls):
+            try:
+                # 通用 JSON 格式，兼容大多数 Webhook
+                # 钉钉格式: {"msgtype": "text", "text": {"content": "xxx"}}
+                # Slack 格式: {"text": "xxx"}
+                # Discord 格式: {"content": "xxx"}
+                
+                # 检测 URL 类型并构造对应格式
+                payload = self._build_custom_webhook_payload(url, content)
+                
+                headers = {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'StockAnalysis/1.0'
+                }
+                
+                response = requests.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    logger.info(f"自定义 Webhook {i+1} 推送成功")
+                    success_count += 1
+                else:
+                    logger.error(f"自定义 Webhook {i+1} 推送失败: HTTP {response.status_code}")
+                    logger.debug(f"响应内容: {response.text[:200]}")
+                    
+            except Exception as e:
+                logger.error(f"自定义 Webhook {i+1} 推送异常: {e}")
+        
+        logger.info(f"自定义 Webhook 推送完成：成功 {success_count}/{len(self._custom_webhook_urls)}")
+        return success_count > 0
+    
+    def _build_custom_webhook_payload(self, url: str, content: str) -> dict:
+        """
+        根据 URL 构建对应的 Webhook payload
+        
+        自动识别常见服务并使用对应格式
+        """
+        url_lower = url.lower()
+        
+        # 钉钉机器人
+        if 'dingtalk' in url_lower or 'oapi.dingtalk.com' in url_lower:
+            return {
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": "股票分析报告",
+                    "text": content
+                }
+            }
+        
+        # Discord Webhook
+        if 'discord.com/api/webhooks' in url_lower or 'discordapp.com/api/webhooks' in url_lower:
+            # Discord 限制 2000 字符
+            truncated = content[:1900] + "..." if len(content) > 1900 else content
+            return {
+                "content": truncated
+            }
+        
+        # Slack Incoming Webhook
+        if 'hooks.slack.com' in url_lower:
+            return {
+                "text": content,
+                "mrkdwn": True
+            }
+        
+        # Bark (iOS 推送)
+        if 'api.day.app' in url_lower:
+            return {
+                "title": "股票分析报告",
+                "body": content[:4000],  # Bark 限制
+                "group": "stock"
+            }
+        
+        # 通用格式（兼容大多数服务）
+        return {
+            "text": content,
+            "content": content,
+            "message": content,
+            "body": content
+        }
+    
     def send(self, content: str) -> bool:
         """
         统一发送接口 - 向所有已配置的渠道发送
@@ -1335,6 +1780,8 @@ class NotificationService:
                     result = self.send_to_telegram(content)
                 elif channel == NotificationChannel.EMAIL:
                     result = self.send_to_email(content)
+                elif channel == NotificationChannel.CUSTOM:
+                    result = self.send_to_custom(content)
                 else:
                     logger.warning(f"不支持的通知渠道: {channel}")
                     result = False
